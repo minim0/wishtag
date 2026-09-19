@@ -58,7 +58,7 @@
     </div>
   </div>
 
-  <h1 id="heading" class="heading is-loading">위시태그</h1>
+  <h1 id="heading" class="heading is-loading" aria-label="불러오는 중"></h1>
   <p id="subheading" class="subheading"></p>
 
   <div class="progress" id="progress" hidden>
@@ -85,24 +85,30 @@
       <button type="submit" class="btn btn-primary">추가하기</button>
     </form>
 
-    <form class="admin-card" id="headingForm" novalidate>
-      <h3>제목 · 설명</h3>
-      <label>제목 <input name="heading" maxlength="80" required></label>
-      <label>설명 <textarea name="subheading" rows="7" maxlength="700"></textarea></label>
-      <button type="submit" class="btn btn-primary">저장하기</button>
-    </form>
+    <details class="admin-card admin-fold">
+      <summary>제목 · 설명</summary>
+      <form class="fold-body" id="headingForm" novalidate>
+        <label>제목 <input name="heading" maxlength="80" required></label>
+        <label>설명 <textarea name="subheading" rows="7" maxlength="700"></textarea></label>
+        <span class="counter mono" id="subCounter" aria-live="polite"></span>
+        <button type="submit" class="btn btn-primary">저장하기</button>
+      </form>
+    </details>
 
-    <form class="admin-card" id="pinChangeForm" novalidate>
-      <h3>PIN 변경</h3>
-      <label>현재 PIN <input name="current" type="password" autocomplete="off" required></label>
-      <label>새 PIN <input name="next" type="password" autocomplete="off" minlength="4" required></label>
-      <label>새 PIN 확인 <input name="confirm" type="password" autocomplete="off" minlength="4" required></label>
-      <button type="submit" class="btn btn-primary">PIN 바꾸기</button>
-    </form>
+    <details class="admin-card admin-fold">
+      <summary>PIN 변경</summary>
+      <form class="fold-body" id="pinChangeForm" novalidate>
+        <label>현재 PIN <input name="current" type="password" autocomplete="off" required></label>
+        <label>새 PIN <input name="next" type="password" autocomplete="off" minlength="4" required></label>
+        <label>새 PIN 확인 <input name="confirm" type="password" autocomplete="off" minlength="4" required></label>
+        <p class="muted small">4자 이상이에요. 숫자만 쓰는 것보다 글자를 섞으면 더 안전해요. 바꾸면 다른 기기의 관리자 모드는 풀려요.</p>
+        <button type="submit" class="btn btn-primary">PIN 바꾸기</button>
+      </form>
+    </details>
 
     <div class="admin-card admin-card-misc">
       <h3>정리</h3>
-      <p class="muted">카드마다 <b>수정 · 해제 · 삭제</b> 버튼이 보여요. 삭제와 해제는 한 번 더 눌러야 실행돼요.</p>
+      <p class="muted">카드마다 <b>수정 · 해제 · 삭제</b> 버튼이 보여요. 삭제와 해제는 한 번 더 눌러야 실행돼요. 링크 칸에는 쇼핑앱의 ‘공유하기’ 문구를 통째로 붙여 넣어도 돼요.</p>
       <button type="button" class="btn btn-danger-ghost" id="clearExamples" hidden></button>
     </div>
   </div>

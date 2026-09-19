@@ -4,6 +4,11 @@
 (() => {
 'use strict';
 
+// iOS 13 이하 웹뷰용 (카카오톡 인앱은 시스템 웹뷰를 씀)
+if (!Element.prototype.replaceChildren) {
+  Element.prototype.replaceChildren = function (...nodes) { this.textContent = ''; this.append(...nodes); };
+}
+
 const API = window.WISHTAG_API ||
   'https://script.google.com/macros/s/AKfycbwjo-6rG-OGLRbf6LMFCWunqXqn0AT4q4U1iPkRbezZdnFISkjDPsdq2RceJQtwuyCQ/exec';
 const POLL_MS = 30000;
@@ -16,6 +21,7 @@ const MESSAGES = {
   'already-claimed': '방금 다른 분이 선점했어요. 다른 항목을 골라주세요!',
   'wrong-secret': '선점 암호가 맞지 않아요',
   'wrong-pin': '관리자 PIN이 맞지 않아요',
+  'pin-changed': '다른 기기에서 PIN이 바뀌었어요. 새 PIN으로 다시 들어와주세요',
   'not-found': '항목을 찾을 수 없어요. 방금 삭제됐을 수 있어요',
   'busy': '지금 사람이 몰렸어요. 잠시 후 다시 시도해주세요',
   'network': '연결이 불안정해요. 네트워크를 확인하고 다시 시도해주세요',
@@ -87,7 +93,10 @@ function safeUrl(u) {
 function normalizeLink(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
-  return safeUrl(/^https?:\/\//i.test(s) ? s : 'https://' + s);
+  // 쇼핑앱 "공유하기" 문구("[쿠팡] 상품명 https://...")를 통째로 붙여 넣어도 링크만 뽑아 씀
+  const found = s.match(/https?:\/\/[^\s<>"']+/i);
+  if (found) return safeUrl(found[0]);
+  return /\s/.test(s) ? '' : safeUrl('https://' + s);
 }
 
 function fmtMonthDay(ms) {
@@ -118,9 +127,8 @@ function jsonp(params) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      window[cb] = () => {};   // 타임아웃 뒤 늦게 도착한 응답이 에러를 내지 않도록
+      window[cb] = () => {};   // 타임아웃 뒤 한참 늦게 도착한 응답도 에러를 내지 않도록 그대로 둠
       el.remove();
-      setTimeout(() => { try { delete window[cb]; } catch (_) { window[cb] = undefined; } }, 60000);
       fn(value);
     };
     window[cb] = data => finish(resolve, data);
@@ -156,7 +164,10 @@ async function runOp(op) {
       } catch (err) {
         if (err.code === 'busy' && attempt < 2) { await sleep(700 * (attempt + 1)); continue; }
         if (err.code === 'network' || err.code === 'server-error') refresh({ quiet: true, force: true });
-        if (err.code === 'wrong-pin' && op.adminPinHash) dropStaleAdmin();
+        if (err.code === 'wrong-pin' && 'adminPinHash' in op) {
+          dropStaleAdmin(false);
+          throw new ApiError('pin-changed');
+        }
         throw err;
       }
     }
@@ -178,9 +189,18 @@ const cardEls = new Map();            // itemId -> element
 const isAdmin = () => !!(adminHash && state && adminHash === state.adminPinHash);
 const findItem = id => (state && state.items || []).find(it => it.id === id);
 
+// 응답 순서가 뒤바뀌어도 더 오래된 데이터로 덮어쓰지 않도록 함.
+// 서버의 updatedAt을 우선 기준으로 쓰고, 없으면 요청 순서로 판단
+function isStale(s, seq) {
+  if (state && typeof s.updatedAt === 'number' && typeof state.updatedAt === 'number') {
+    return s.updatedAt < state.updatedAt;
+  }
+  return seq < appliedSeq;
+}
+
 function applyState(s, seq) {
-  if (seq < appliedSeq) return;       // 더 늦게 시작한 요청의 결과가 이미 반영됨
-  appliedSeq = seq;
+  if (isStale(s, seq)) { lastSync = new Date(); renderSync(false); return; }
+  appliedSeq = Math.max(appliedSeq, seq);
   state = s;
   state.items = Array.isArray(s.items) ? s.items : [];
   lastSync = new Date();
@@ -196,14 +216,19 @@ function setAdmin(hash) {
 function reconcileAdmin() {
   if (!adminHash || !state) return;
   if (state.adminPinHash === adminHash) return;
-  if (pendingPinHash && state.adminPinHash === pendingPinHash) { setAdmin(pendingPinHash); return; }
+  if (pendingPinHash && state.adminPinHash === pendingPinHash) {
+    // 내가 바꾼 PIN이 (응답이 늦었더라도) 서버에 반영된 것
+    setAdmin(pendingPinHash);
+    pendingPinHash = null;
+    return;
+  }
   dropStaleAdmin();
 }
-function dropStaleAdmin() {
+function dropStaleAdmin(showToast = true) {
   if (!adminHash) return;
   setAdmin(null);
   headingDirty = false;
-  toast('PIN이 바뀌어 관리자 모드가 해제됐어요');
+  if (showToast) toast(MESSAGES['pin-changed'], 4000);
   render();
 }
 
@@ -239,6 +264,7 @@ function renderHeader() {
   const heading = state.heading || '위시태그';
   hEl.textContent = heading;
   hEl.classList.remove('is-loading');
+  hEl.removeAttribute('aria-label');
   sEl.textContent = state.subheading || '';
   document.title = heading;
 
@@ -294,10 +320,16 @@ function renderGrid() {
   const admin = isAdmin();
   const active = document.activeElement;
   const refocusId = active && active.classList.contains('nick') ? active.closest('.card').dataset.id : null;
-  const seen = new Set();
+  const caret = refocusId ? active.selectionStart : null;
+
+  // 없어진 카드를 먼저 빼야 뒤 카드들이 불필요하게 옮겨지지 않음(옮기면 입력 포커스가 풀림)
+  const ids = new Set(items.map(it => it.id));
+  for (const [id, el] of cardEls) {
+    if (!ids.has(id)) { el.remove(); cardEls.delete(id); }
+  }
+
   let prev = null;
   items.forEach((it, i) => {
-    seen.add(it.id);
     const sig = JSON.stringify([i, it.name, it.note, it.link, it.claimedBy, it.claimedAt, !!it.example, admin]);
     let el = cardEls.get(it.id);
     if (!el || el.dataset.sig !== sig) {
@@ -306,17 +338,19 @@ function renderGrid() {
       if (el) el.replaceWith(next);
       el = next;
       cardEls.set(it.id, el);
-      if (refocusId === it.id) {
-        const input = el.querySelector('.nick');
-        if (input) input.focus();
-      }
     }
     const want = prev ? prev.nextSibling : grid.firstChild;
     if (want !== el) grid.insertBefore(el, want);
     prev = el;
   });
-  for (const [id, el] of cardEls) {
-    if (!seen.has(id)) { el.remove(); cardEls.delete(id); }
+
+  if (refocusId) {
+    const card = cardEls.get(refocusId);
+    const input = card && card.querySelector('.nick');
+    if (input && document.activeElement !== input) {
+      try { input.focus({ preventScroll: true }); } catch (_) { input.focus(); }
+      if (caret != null) { try { input.setSelectionRange(caret, caret); } catch (_) {} }
+    }
   }
 }
 
@@ -339,9 +373,11 @@ function buildCard(it, index, admin) {
       h('label', { class: 'sr-only', for: nickId }, `${it.name} 선점할 닉네임`),
       h('input', {
         class: 'nick', id: nickId, type: 'text', maxlength: '20', placeholder: '내 닉네임',
-        autocomplete: 'off', enterkeyhint: 'go',
+        autocomplete: 'off', enterkeyhint: 'go', 'aria-describedby': `${nickId}-err`,
         value: drafts[it.id] || '',
       }),
+      // 토스트는 화면 아래라 휴대폰 키보드에 가려질 수 있어서 칸 바로 아래에 안내
+      h('p', { class: 'nick-error', id: `${nickId}-err`, hidden: true }, '닉네임을 먼저 적어주세요'),
       h('button', { type: 'button', class: 'btn btn-primary', dataset: { act: 'claim' } }, '선점하기'));
   }
 
@@ -360,7 +396,8 @@ function buildCard(it, index, admin) {
 
 function syncBusy() {
   const busy = opsInFlight > 0;
-  document.querySelectorAll('[data-act], #adminPanel button, #pinForm button').forEach(b => {
+  // 작업 중에 새로고침을 누르면 작업 결과보다 오래된 목록이 덮어쓸 수 있어서 같이 막음
+  document.querySelectorAll('[data-act], #adminPanel button, #pinForm button, #refreshBtn').forEach(b => {
     if (b.classList.contains('is-loading')) return;
     b.disabled = busy;
   });
@@ -388,11 +425,46 @@ function toast(msg, ms = 2800) {
 
 /* ---------- sheet (modal) ---------- */
 let sheetOpen = false;
-let sheetReturnFocus = null;
+let sheetSubmitting = false;
+let sheetOpenedAt = 0;
+let sheetReturn = null;   // { el, cardId, act } — 닫은 뒤 포커스를 돌려줄 곳
+
+function rememberReturnFocus() {
+  const el = document.activeElement;
+  const card = el && el.closest ? el.closest('.card') : null;
+  sheetReturn = { el, cardId: card ? card.dataset.id : null, act: el && el.dataset ? el.dataset.act : null };
+}
+function restoreReturnFocus() {
+  const r = sheetReturn;
+  sheetReturn = null;
+  if (!r) return;
+  let target = r.el && document.contains(r.el) ? r.el : null;
+  if (!target && r.cardId) {
+    // 카드가 다시 그려졌으면 같은 카드 안의 같은 버튼(없으면 첫 버튼·링크)으로.
+    // 입력칸은 제외함(휴대폰에서 키보드가 갑자기 올라오므로)
+    const card = cardEls.get(r.cardId);
+    if (card) target = (r.act && card.querySelector(`[data-act="${r.act}"]`)) || card.querySelector('button, a');
+  }
+  if (target) { try { target.focus({ preventScroll: true }); } catch (_) {} }
+}
+
+// 휴대폰 키보드가 올라오면 시트를 보이는 영역(visual viewport)에 맞춰 버튼이 가려지지 않게 함
+function fitSheetToViewport() {
+  const root = $('#sheet');
+  const vv = window.visualViewport;
+  if (!sheetOpen || !vv) { root.style.top = root.style.height = root.style.bottom = ''; return; }
+  root.style.top = `${vv.offsetTop}px`;
+  root.style.height = `${vv.height}px`;
+  root.style.bottom = 'auto';
+}
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', fitSheetToViewport);
+  visualViewport.addEventListener('scroll', fitSheetToViewport);
+}
 
 function openSheet({ title, item, text, fields = [], submitLabel, danger = false, onSubmit }) {
   const root = $('#sheet');
-  sheetReturnFocus = document.activeElement;
+  rememberReturnFocus();
   const errorEl = h('p', { class: 'sheet-error', role: 'alert', hidden: true });
   const submitBtn = h('button', { type: 'submit', class: 'btn ' + (danger ? 'btn-danger' : 'btn-primary') }, submitLabel);
   const inputs = {};
@@ -404,7 +476,7 @@ function openSheet({ title, item, text, fields = [], submitLabel, danger = false
       id, name: f.name, type: f.multiline ? null : (f.type || 'text'),
       value: f.value || '', placeholder: f.placeholder || '', maxlength: f.maxlength ? String(f.maxlength) : null,
       autocomplete: 'off', autocapitalize: 'off', autocorrect: 'off', spellcheck: 'false',
-      inputmode: f.inputmode || null, required: !!f.required,
+      inputmode: f.inputmode || null, required: !!f.required, enterkeyhint: 'go',
     });
     if (f.multiline) input.value = f.value || '';
     inputs[f.name] = input;
@@ -424,22 +496,25 @@ function openSheet({ title, item, text, fields = [], submitLabel, danger = false
     fieldEls.length ? h('div', { class: 'sheet-fields' }, fieldEls) : null,
     errorEl,
     h('div', { class: 'sheet-actions' },
-      h('button', { type: 'button', class: 'btn btn-ghost', onclick: closeSheet }, '닫기'),
+      h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => closeSheet() }, '닫기'),
       submitBtn));
 
   form.addEventListener('submit', async e => {
     e.preventDefault();
-    if (submitBtn.classList.contains('is-loading')) return;
+    if (sheetSubmitting) return;
     errorEl.hidden = true;
     const values = {};
     for (const [k, el] of Object.entries(inputs)) values[k] = el.value;
+    sheetSubmitting = true;
     submitBtn.classList.add('is-loading');
     form.querySelectorAll('button, input, textarea').forEach(el => { if (el !== submitBtn) el.disabled = true; });
     try {
       await onSubmit(values);
+      sheetSubmitting = false;
       closeSheet();
     } catch (err) {
-      if (!sheetOpen) return;
+      sheetSubmitting = false;
+      if (!sheetOpen) { toast(err.message || MESSAGES['server-error']); return; }
       if (err instanceof FieldError) {
         const wrap = form.querySelector(`[data-field="${err.field}"]`);
         const fe = wrap.querySelector('.field-error');
@@ -447,7 +522,7 @@ function openSheet({ title, item, text, fields = [], submitLabel, danger = false
         fe.hidden = false;
         inputs[err.field].classList.add('is-invalid');
         setTimeout(() => inputs[err.field].focus(), 0);
-      } else if (err.code === 'already-claimed' || err.code === 'not-found') {
+      } else if (err.code === 'already-claimed' || err.code === 'not-found' || err.code === 'pin-changed') {
         closeSheet();
         toast(err.message, 3500);
       } else {
@@ -460,26 +535,30 @@ function openSheet({ title, item, text, fields = [], submitLabel, danger = false
     }
   });
 
-  root.replaceChildren(h('div', { class: 'sheet-backdrop', onclick: closeSheet }), form);
+  // 선점하기를 두 번 톡톡 누르면 두 번째 탭이 배경에 떨어져 바로 닫히는 걸 막음
+  const backdrop = h('div', { class: 'sheet-backdrop', onclick: () => { if (Date.now() - sheetOpenedAt > 400) closeSheet(); } });
+  root.replaceChildren(backdrop, form);
   root.hidden = false;
   sheetOpen = true;
+  sheetSubmitting = false;
+  sheetOpenedAt = Date.now();
   document.body.classList.add('sheet-open');
+  fitSheetToViewport();
   // 클릭 핸들러 안에서 동기적으로 포커스해야 iOS가 키보드를 바로 띄움
   const first = form.querySelector('input, textarea') || submitBtn;
   try { first.focus({ preventScroll: true }); } catch (_) { first.focus(); }
 }
 
+// 요청이 진행 중일 때는 닫지 않음(닫으면 결과·오류를 볼 수 없음)
 function closeSheet() {
-  if (!sheetOpen) return;
+  if (!sheetOpen || sheetSubmitting) return;
   const root = $('#sheet');
   root.hidden = true;
   root.replaceChildren();
   sheetOpen = false;
   document.body.classList.remove('sheet-open');
-  if (sheetReturnFocus && document.contains(sheetReturnFocus)) {
-    try { sheetReturnFocus.focus({ preventScroll: true }); } catch (_) {}
-  }
-  sheetReturnFocus = null;
+  fitSheetToViewport();
+  restoreReturnFocus();
 }
 
 document.addEventListener('keydown', e => {
@@ -494,8 +573,9 @@ function startClaim(item, card) {
     input.classList.remove('is-invalid');
     void input.offsetWidth;
     input.classList.add('is-invalid');
+    const hint = card.querySelector('.nick-error');
+    if (hint) hint.hidden = false;
     input.focus();
-    toast('닉네임을 먼저 적어주세요');
     return;
   }
   openSheet({
@@ -510,7 +590,13 @@ function startClaim(item, card) {
     async onSubmit({ secret }) {
       if (secret.trim().length < 4) throw new FieldError('secret', '암호는 4자 이상으로 정해주세요');
       const secretHash = await sha256Hex(secret.trim());
-      await runOp({ type: 'claim', itemId: item.id, nickname, secretHash, claimedAt: Date.now() });
+      try {
+        await runOp({ type: 'claim', itemId: item.id, nickname, secretHash, claimedAt: Date.now() });
+      } catch (err) {
+        // 앞선 요청이 응답만 늦고 사실은 저장됐던 경우: 선점한 사람이 바로 나 자신
+        const now = findItem(item.id);
+        if (err.code !== 'already-claimed' || !now || now.claimSecretHash !== secretHash) throw err;
+      }
       delete drafts[item.id];
       toast(`선점 완료! ${nickname}님 고마워요`);
     },
@@ -550,6 +636,7 @@ function startEdit(item) {
     ],
     submitLabel: '저장',
     async onSubmit({ name, note, link }) {
+      if (!isAdmin()) throw new ApiError('pin-changed');
       if (!name.trim()) throw new FieldError('name', '이름을 입력해주세요');
       const clean = normalizeLink(link);
       if (link.trim() && !clean) throw new FieldError('link', '올바른 주소가 아니에요');
@@ -565,7 +652,7 @@ function armConfirm(btn) {
   btn.dataset.label = btn.textContent;
   btn.textContent = btn.dataset.confirm;
   btn.classList.add('is-confirm');
-  confirmTimers.set(btn, setTimeout(() => disarmConfirm(btn), 3000));
+  confirmTimers.set(btn, setTimeout(() => disarmConfirm(btn), 4000));
   return false;
 }
 function disarmConfirm(btn) {
@@ -602,8 +689,11 @@ grid.addEventListener('click', e => {
 });
 grid.addEventListener('input', e => {
   if (!e.target.classList.contains('nick')) return;
-  drafts[e.target.closest('.card').dataset.id] = e.target.value;
+  const card = e.target.closest('.card');
+  drafts[card.dataset.id] = e.target.value;
   e.target.classList.remove('is-invalid');
+  const hint = card.querySelector('.nick-error');
+  if (hint) hint.hidden = true;
 });
 grid.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
@@ -635,6 +725,10 @@ pinForm.addEventListener('submit', async e => {
   let hash;
   try { hash = await sha256Hex(pin); } catch (err) { toast(err.message); return; }
   if (hash !== state.adminPinHash) {
+    // 다른 기기에서 방금 PIN을 바꿨을 수 있으니 최신 상태로 한 번 더 확인
+    await withLoading(submitButton(pinForm), () => refresh({ force: true, quiet: true }));
+  }
+  if (hash !== state.adminPinHash) {
     input.classList.remove('is-invalid');
     void input.offsetWidth;
     input.classList.add('is-invalid');
@@ -659,7 +753,11 @@ $('#adminLogout').addEventListener('click', () => {
 /* ---------- admin: panel ---------- */
 let headingDirty = false;
 const headingForm = $('#headingForm');
-headingForm.addEventListener('input', () => { headingDirty = true; });
+function updateSubCounter() {
+  const ta = headingForm.subheading;
+  $('#subCounter').textContent = `${ta.value.length} / ${ta.maxLength}`;
+}
+headingForm.addEventListener('input', () => { headingDirty = true; updateSubCounter(); });
 
 function renderAdminPanel() {
   const panel = $('#adminPanel');
@@ -669,6 +767,7 @@ function renderAdminPanel() {
   if (!headingDirty) {
     headingForm.heading.value = state.heading || '';
     headingForm.subheading.value = state.subheading || '';
+    updateSubCounter();
   }
   const examples = state.items.filter(it => it.example).length;
   const btn = $('#clearExamples');
@@ -677,6 +776,19 @@ function renderAdminPanel() {
 }
 
 function submitButton(form) { return form.querySelector('button[type="submit"]'); }
+
+function showCard(id) {
+  const el = cardEls.get(id);
+  if (!el) return;
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  el.classList.remove('is-new');
+  void el.offsetWidth;
+  el.classList.add('is-new');
+}
+
+// 응답이 늦어 실패로 보였지만 실제로는 저장된 경우, 다시 눌러도 중복으로 추가되지 않도록
+// 같은 내용이면 같은 항목 id를 재사용하고 서버 목록에 이미 있는지 먼저 확인함
+let pendingAdd = null;   // { key, id }
 
 $('#addForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -687,12 +799,24 @@ $('#addForm').addEventListener('submit', async e => {
   const link = normalizeLink(rawLink);
   if (!name) { form.name.focus(); toast('이름을 입력해주세요'); return; }
   if (rawLink && !link) { form.link.focus(); toast('링크 주소를 확인해주세요'); return; }
+  const btn = submitButton(form);
+  const key = JSON.stringify([name, note, link]);
+  const retrying = pendingAdd && pendingAdd.key === key;
+  if (!retrying) pendingAdd = { key, id: newItemId() };
+  const id = pendingAdd.id;
+  const done = msg => { pendingAdd = null; form.reset(); toast(msg); setTimeout(() => showCard(id), 50); };
   try {
-    await withLoading(submitButton(form), () =>
-      runOp({ type: 'add-item', item: { id: newItemId(), name, note, link }, adminPinHash: adminHash }));
-    form.reset();
-    toast(`‘${name}’ 추가했어요`);
-  } catch (err) { toast(err.message); }
+    if (retrying) {
+      // 진행 중인 느린 조회를 재사용하지 않고 새로 조회함. 조회가 실패하면 다시 보내지 않음(중복 방지)
+      await withLoading(btn, () => call({ action: 'state' }));
+      if (findItem(id)) { done(`이미 추가돼 있어요 (‘${name}’)`); return; }
+    }
+    await withLoading(btn, () => runOp({ type: 'add-item', item: { id, name, note, link }, adminPinHash: adminHash }));
+    done(`‘${name}’ 추가했어요`);
+  } catch (err) {
+    if (err.code !== 'network' && err.code !== 'server-error') pendingAdd = null;
+    toast(err.message);
+  }
 });
 
 headingForm.addEventListener('submit', async e => {
@@ -723,13 +847,14 @@ $('#pinChangeForm').addEventListener('submit', async e => {
     const newHash = await sha256Hex(next);
     pendingPinHash = newHash;
     await withLoading(submitButton(form), () => runOp({ type: 'change-pin', currentPinHash, newHash }));
+    pendingPinHash = null;
     setAdmin(newHash);
     form.reset();
     toast('PIN을 바꿨어요');
   } catch (err) {
-    toast(err.message);
-  } finally {
-    pendingPinHash = null;
+    // 응답만 늦은 경우엔 서버에 반영됐을 수 있으니, 다음 동기화에서 확인되도록 pendingPinHash를 남겨 둠
+    if (err.code !== 'network' && err.code !== 'server-error') pendingPinHash = null;
+    toast(err.code === 'wrong-pin' ? '현재 PIN이 맞지 않아요' : err.message);
   }
 });
 
@@ -765,7 +890,8 @@ function setupInappBanner() {
 
   const isIOS = /iPhone|iPad|iPod/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   const isAndroid = /Android/i.test(ua);
-  const browserTo = isIOS ? '사파리로' : '크롬으로';
+  // 안드로이드는 기본 브라우저가 크롬이 아닐 수도 있어서(삼성 인터넷 등) 특정 앱을 단정하지 않음
+  const browserTo = isIOS ? '사파리로' : '크롬 같은 다른 브라우저로';
   const here = location.href;
 
   let openLabel = null;
@@ -774,7 +900,7 @@ function setupInappBanner() {
     openLabel = isIOS ? '사파리로 열기' : '다른 브라우저로 열기';
     openUrl = 'kakaotalk://web/openExternal?url=' + encodeURIComponent(here);
   } else if (app.key === 'line') {
-    openLabel = `${browserTo} 열기`;
+    openLabel = isIOS ? '사파리로 열기' : '다른 브라우저로 열기';
     const u = new URL(here);
     u.searchParams.set('openExternalBrowser', '1');
     openUrl = u.href;
@@ -788,7 +914,7 @@ function setupInappBanner() {
   text.replaceChildren(...[
     `${app.name} 안에서 열렸어요. 쇼핑몰 링크가 잘 안 열릴 수 있으니 `,
     h('b', {}, `${browserTo} 열어주세요.`),
-    openUrl ? null : ' 오른쪽 위 ··· 메뉴에서 ‘외부 브라우저로 열기’를 눌러도 돼요.',
+    openUrl ? null : ' 오른쪽 위 ··· 메뉴에서 ‘외부 브라우저로 열기’를 눌러주세요.',
   ].filter(Boolean));
 
   const openBtn = $('#inappOpen');
