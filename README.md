@@ -2,7 +2,7 @@
 
 생일 위시리스트 페이지예요. 친구들이 항목을 **선점**해서 선물이 겹치지 않게 해줘요.
 
-- 페이지: https://benny3s.github.io/wishtag/
+- 페이지: https://minim0.github.io/wishtag/
 - 프론트엔드: GitHub Pages에 올린 정적 파일(`index.html`, `style.css`, `app.js`). 빌드 과정 없음
 - 백엔드: Google Apps Script 웹 앱(URL은 `app.js`의 `API`). 데이터는 ScriptProperties에 저장됨
 
